@@ -2,15 +2,22 @@ from typing import List
 
 from fastapi import FastAPI, Query, Cookie, Header, HTTPException
 from pydantic import BaseModel, Field
+from starlette.requests import Request
 from starlette.responses import Response
 from starlette.status import HTTP_201_CREATED, HTTP_404_NOT_FOUND
+from starlette.staticfiles import StaticFiles
+from starlette.templating import Jinja2Templates
 
 import random
 import asyncio
 
-import ymyt
+from ymyt import Watcher
 
 app = FastAPI()
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/media", StaticFiles(directory="media"), name="media")
+templates = Jinja2Templates(directory="templates")
+watcher = Watcher()
 
 class Candle(BaseModel):
     time: str
@@ -23,23 +30,23 @@ class Avg(BaseModel):
     time: str
     value: float
 
-YMYT_TASK = None
+@app.on_event("startup")
+async def startup_event():
+    await watcher.start()
+    print("协程已启动")
 
-@app.get("/start/")
-async def start():
-    global YMYT_TASK
-    YMYT_TASK = asyncio.create_task(ymyt.main())
-    return "协程已启动"
+@app.on_event("shutdown")
+async def shutdown_event():
+    await watcher.stop()
+    print("协程已关闭")
 
-@app.get("/stop/")
-async def start():
-    global YMYT_TASK
-    YMYT_TASK.cancel()
-    return "已发送取消请求"
+@app.get("/")
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/api/candles/")
 def get_candles():
-    return ymyt.STATE['candles']
+    return watcher.state['candles']
 
 @app.get("/api/avgs/")
 def get_avgs():
