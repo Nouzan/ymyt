@@ -67,22 +67,22 @@ def get_avgs():
     ) for avg in sorted(avgs, key=lambda avg: avg[0])]
     return avgs
 
-async def send_datas(websocket):
-    candles = watcher.state['candles']
+async def send_datas(websocket, candles, avgs):
+    # candles = watcher.state['candles']
     candles = [Candle(
-        time=candles[t][0],
-        open=candles[t][3],
-        high=candles[t][2],
-        low=candles[t][1],
-        close=candles[t][4],
-    ).json() for t in sorted(candles)]
+        time=candle[0],
+        open=candle[3],
+        high=candle[2],
+        low=candle[1],
+        close=candle[4],
+    ).json() for candle in sorted(candles)]
 
     await websocket.send_json({
         'type': 'candles',
         'data': candles
     })
 
-    avgs = watcher.state['avgs']
+    # avgs = watcher.state['avgs']
     avgs = [Avg(
         time=avg[0],
         value=avg[1]
@@ -97,8 +97,17 @@ async def send_datas(websocket):
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     data = await websocket.receive_text()
-    await send_datas(websocket)
-    if data == 'subscribe':
-        while True:
-            await watcher.wait_for_ticker()
-            await send_datas(websocket)
+    candles = watcher.get_candles()
+    avgs = watcher.get_avgs()
+    queue = await watcher.subscribe()
+    try:
+        await send_datas(websocket, candles, avgs)
+        if data == 'subscribe':
+            while True:
+                candles, avgs = await watcher.next(queue)
+                await send_datas(websocket, candles, avgs)
+    except Exception as err:
+        print(err)
+        pass
+    finally:
+        await watcher.unsubscribe(queue)

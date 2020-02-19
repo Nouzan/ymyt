@@ -2,6 +2,7 @@ from typing import Dict, Any, Optional, List, Tuple
 
 import aiohttp
 import asyncio
+from copy import deepcopy
 from datetime import datetime, timedelta
 
 from coinbase import CoinBaseApi
@@ -9,26 +10,34 @@ from utils import roll_down_to_hours
 
 class Watcher:
     FIRST_FETCH = 3000                                             # 首次爬取的K线数量
+    LISTENER_MAX_SIZE = 3000                                       # 监听器注册队列的最大长度
+    QUEUE_MAX_SIZE = 100                                           # 每个监听器的消息队列的最大长度
+
     state = None                                                   # 运行状态
     api = None
 
     def __init__(self, polling_interval: float=1):
         self.state = {
-            'ticker': None,      # 缓存最新成交价
-            'candles': {},       # 缓存K线数据 { t: [t, l, h, o, c, v] }
-            'avgs': [],          # 缓存基准线数据
-            'start': None,       # 记录起始K线时间戳
-            'count': 0,          # 记录已检查的从start开始的完整K线数据数量
-            'lastest_t': None,   # 最新K线时间戳
-            'fetching': False,   # 标记是否正在爬取K线，避免watcher反复创建爬取协程
-            'last_ticker': None, # 缓存上一次成交价
+            'ticker': None,                                        # 缓存最新成交价
+            'candles': {},                                         # 缓存K线数据 { t: [t, l, h, o, c, v] }
+            'sorted_candles': [],                                  # 已排序的K线数据(时间递增)
+            'avgs': [],                                            # 缓存基准线数据
+            'start': None,                                         # 记录起始K线时间戳
+            # 'count': 0,                                            # 记录已检查的从start开始的完整K线数据数量
+            'lastest_t': None,                                     # 最新K线时间戳
+            'fetching': False,                                     # 标记是否正在爬取K线，避免watcher反复创建爬取协程
+            'last_ticker': None,                                   # 缓存上一次成交价
         }
 
-        self.ticker_updated_event = asyncio.Event()                # 标记ticker是否更新 TODO: 目前的实现方式是有缺陷的
+        # self.ticker_updated_event = asyncio.Event()                # 标记ticker是否更新 TODO: 目前的实现方式是有缺陷的
         self.api = CoinBaseApi()                                   # 数据API绑定
         self.running = False                                       # 运行标志
         self.task = None                                           # _main()协程自绑定
         self.polling_interval = polling_interval                   # 定义轮询时间间隔
+        self.listener_queues = asyncio.Queue(                      # 监听器注册队列
+            maxsize=self.LISTENER_MAX_SIZE
+        )
+        self.listeners = []                                        # 监听器列表
 
     async def _main(self):
         """
@@ -70,13 +79,13 @@ class Watcher:
         self.running = False
         await self.task
 
-    def calc_avg(self, data: Dict[int, list], start: int, count: int) -> List[Tuple[int, float]]:
+    def calc_avg(self) -> List[Tuple[int, float]]:
         """
         计算一目均衡图中的基准线
         """
-        ohlcs = [data[start + 3600 * i] for i in range(count)]     # 读取已缓存的K线数据, 并转换为K线列表
-        if start + 3600 * count in data:                           # 边界情况
-            ohlcs.append(data[start + 3600 * count])
+        ohlcs = deepcopy(self.state['sorted_candles'])             # 读取已缓存的K线数据, 并转换为K线列表
+        if ohlcs[-1][0] + 3600 in self.state['candles']:              # 边界情况
+            ohlcs.append(self.state['candles'][ohlcs[-1][0] + 3600])
         ohlcs.reverse()                                            # 使K线变为按时间由近到远排序
 
         avgs = []
@@ -86,6 +95,23 @@ class Watcher:
             avg = (M + m) / 2
             avgs.append((ohlcs[i][0], avg))
         return avgs
+
+    async def subscribe(self) -> asyncio.Queue:
+        """
+        协程: 向Watcher注册一个监听者消息队列
+        """
+        await self.listener_queues.put(None)
+        queue = asyncio.Queue(maxsize=self.QUEUE_MAX_SIZE)
+        self.listeners.append(queue)
+        return queue
+
+    async def unsubscribe(self, queue):
+        """
+        协程: 向Watcher注销一个监听者消息队列
+        """
+        if queue in self.listeners:
+            self.listeners.remove(queue)
+            await self.listener_queues.get()
 
     async def _fetch_one(self, index) -> None:
         """
@@ -101,42 +127,74 @@ class Watcher:
         """
         协程: 用于检查目前的运行状态, 包括检查K线缓存是否完整(若不完整则请求)
         """
-        if self.state['ticker']\
-            and self.state['count']\
-            and self.state['count'] >= 26:
+        if self.state['ticker'] and len(self.state['sorted_candles']) >= 26:
             # 如果已经准备好数据
 
-            avgs = self.calc_avg(self.state['candles'], self.state['start'], self.state['count'])
+            avgs = self.calc_avg()
             self.state['avgs'] = avgs
-            # now = roll_down_to_hours(datetime.now().timestamp())
+            now = roll_down_to_hours(datetime.now().timestamp())
 
             # 显示状态
-            # print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['start'] + 3600 * self.state['count']}, {'牛' if self.state['ticker'] > avgs[0] else '熊'}")
+            print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['sorted_candles'][-1]}, {len(self.listeners)}")
 
         if self.state['start'] is not None and not self.state['fetching']:
             # 如果已完成第一次K线爬取，且未处于爬取状态
 
             # 跟踪当前已爬取的K线时间戳
             # 算法假设从start ~ start + 3600 * count的时间范围内的K线数据是完整的
-            index = self.state['start'] + 3600 * self.state['count']
+            index = self.state['start'] + 3600 * len(self.state['sorted_candles'])
             hour = timedelta(hours=1)                               # 1小时
-            while index < (datetime.now() - hour).timestamp():      # 循环直到爬取到最新K线
+            while index < (datetime.now() - hour).timestamp():      # 循环检查直到最新K线
                 if index not in self.state['candles']:              # 若该时间戳对应K线不存在，则爬取
                     asyncio.create_task(self._fetch_one(index))     # 启动爬取K线的协程
                     break
                 else:
+                    self.state['sorted_candles'].append(self.state['candles'][index])
                     index += 3600
-                    self.state['count'] += 1
-        if self.state['ticker'] != self.state['last_ticker']:
-            self.state['last_ticker'] = self.state['ticker']
-            self.ticker_updated_event.set()
-        else:
-            self.ticker_updated_event.clear()
 
-    async def wait_for_ticker(self) -> None:
-        await self.ticker_updated_event.wait()
-        # print("ticker update!")
-        self.ticker_updated_event.clear()
+        if self.state['ticker'] != self.state['last_ticker'] and len(self.state['candles']) > 0 and self.state['lastest_t']:
+            self.state['last_ticker'] = self.state['ticker']
+
+            candle_len = len(self.state['sorted_candles'])
+            last_candle = self.state['candles'][self.state['lastest_t']]
+            if last_candle[0] == self.state['sorted_candles'][-1][0]:
+                candle_len -= 1
+            for queue in self.listeners:
+                asyncio.create_task(queue.put({
+                    'ticker': self.state['ticker'],
+                    'candles': candle_len,
+                    'last_candle': last_candle,
+                    'avgs': self.state['avgs'],
+                }))
+            # self.ticker_updated_event.set()
+        # else:
+        #     self.ticker_updated_event.clear()
+
+    # async def wait_for_ticker(self) -> None:
+    #     await self.ticker_updated_event.wait()
+    #     # print("ticker update!")
+    #     self.ticker_updated_event.clear()
+
+    def get_candles(self) -> List[list]:
+        candles = deepcopy(self.state['sorted_candles'])
+        last_candle = self.state['candles'][self.state['lastest_t']]
+        candles.append(last_candle)
+        return candles
+
+    def get_avgs(self) -> List[Tuple[int, float]]:
+        avgs = deepcopy(self.state['avgs'])
+        return avgs
+
+    async def next(self, queue: asyncio.Queue) -> Tuple[List[list], List[Tuple[int, float]]]:
+        if queue in self.listeners:
+            update = await queue.get()
+            queue.task_done()
+            return (
+                self.state['sorted_candles'][:update['candles']] + [update['last_candle']],
+                update['avgs'],
+            )
+        else:
+            return None
 
     async def _crawler(self) -> None:
         """
