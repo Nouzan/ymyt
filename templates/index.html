@@ -29,6 +29,22 @@
             },
         });
         chart.applyOptions({
+            grid: {
+                vertLines: {
+                    color: 'rgba(70, 130, 180, 0.5)',
+                    style: 1,
+                    visible: false,
+                },
+                horzLines: {
+                    color: 'rgba(70, 130, 180, 0.5)',
+                    style: 1,
+                    visible: false,
+                },
+            },
+            layout: {
+                backgroundColor: '#0e153a',
+                textColor: "#ffffff",
+            },
             priceScale: {
                 position: 'right',
                 mode: 0,
@@ -56,14 +72,21 @@
         });
         const candlestickSeries = chart.addCandlestickSeries();
         candlestickSeries.applyOptions({
+            priceLineColor: '#ffffff',
+            upColor: '#0e153a',
+            borderVisible: true,
+            wickVisible: true,
             priceFormat: {
                 type: 'price',
                 precision: 6,
                 minMove: 0.000001,
             },
         })
-        const lineSeries = chart.addLineSeries();
-        lineSeries.applyOptions({
+        const turnSeries = chart.addLineSeries();
+        turnSeries.applyOptions({
+            lineWidth: 1,
+            color: "#ff9f68",
+            priceLineVisible: false,
             priceFormat: {
                 type: 'price',
                 precision: 6,
@@ -71,20 +94,84 @@
             },
         })
 
-        // Server  < ------ > Client
-        // -----------------> text
-        // text <-------------------
+        const baseSeries = chart.addLineSeries();
+        baseSeries.applyOptions({
+            lineWidth: 1,
+            color: "#28c7fa",
+            priceLineVisible: false,
+            priceFormat: {
+                type: 'price',
+                precision: 6,
+                minMove: 0.000001,
+            },
+        })
+
+        const delaySeries = chart.addLineSeries();
+        delaySeries.applyOptions({
+            lineWidth: 1,
+            color: "#a7ff83",
+            priceLineVisible: false,
+            priceFormat: {
+                type: 'price',
+                precision: 6,
+                minMove: 0.000001,
+            },
+        })
+
+        const anteASeries = chart.addLineSeries();
+        anteASeries.applyOptions({
+            lineWidth: 1,
+            color: "#faee1c",
+            lineColor: "#faee1c",
+            topColor: "rgba(250,238,28,0.5)",
+            bottomColor: "rgba(250,238,28,0.5)",
+            lineStyle: 2,
+            priceLineVisible: false,
+            priceFormat: {
+                type: 'price',
+                precision: 6,
+                minMove: 0.000001,
+            },
+        })
+
+        const anteBSeries = chart.addLineSeries();
+        anteBSeries.applyOptions({
+            lineWidth: 1,
+            color: "#ff304f",
+            lineColor: "#ff304f",
+            topColor: "rgba(255,48,79, 0.5)",
+            bottomColor: "rgba(255,48,79, 0.5)",
+            lineStyle: 2,
+            priceLineVisible: false,
+            priceFormat: {
+                type: 'price',
+                precision: 6,
+                minMove: 0.000001,
+            },
+        })
 
         var ws = new WebSocket("ws://localhost:8000/ws");
         ws.onmessage = function(event) {
             text = event.data
             data = JSON.parse(text)
             if (data.type == 'candles') {
+                console.log('candles', data.data)
                 update(candlestickSeries, chart, data.data);
-            } else if (data.type == 'avgs') {
-                update(lineSeries, chart, data.data);
-            } else {
-                console.log("Something wrong")
+            } else if (data.type == 'turns') {
+                console.log('turns', data.data)
+                update(turnSeries, chart, data.data);
+            } else if (data.type == 'bases') {
+                console.log('bases', data.data)
+                update(baseSeries, chart, data.data);
+            } else if (data.type == 'delays') {
+                console.log('delays', data.data)
+                update(delaySeries, chart, data.data);
+            } else if (data.type == 'antes_1') {
+                console.log('antes_1', data.data)
+                update(anteASeries, chart, data.data);
+            } else if (data.type == 'antes_2') {
+                console.log('antes_2', data.data)
+                update(anteBSeries, chart, data.data);
             }
 
         }

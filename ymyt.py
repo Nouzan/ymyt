@@ -6,7 +6,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta
 
 from coinbase import CoinBaseApi
-from utils import roll_down_to_hours
+from utils import roll_down_to_hours, max_min_avg, move
 
 class Watcher:
     FIRST_FETCH = 3000                                             # 首次爬取的K线数量
@@ -21,7 +21,7 @@ class Watcher:
             'ticker': None,                                        # 缓存最新成交价
             'candles': {},                                         # 缓存K线数据 { t: [t, l, h, o, c, v] }
             'sorted_candles': [],                                  # 已排序的K线数据(时间递增)
-            'avgs': [],                                            # 缓存基准线数据
+            'calcs': (),                                           # 缓存基准线数据
             'start': None,                                         # 记录起始K线时间戳
             # 'count': 0,                                            # 记录已检查的从start开始的完整K线数据数量
             'lastest_t': None,                                     # 最新K线时间戳
@@ -79,22 +79,26 @@ class Watcher:
         self.running = False
         await self.task
 
-    def calc_avg(self) -> List[Tuple[int, float]]:
-        """
-        计算一目均衡图中的基准线
-        """
+    def _get_ohlcs_for_calc(self) -> List[list]:
         ohlcs = deepcopy(self.state['sorted_candles'])             # 读取已缓存的K线数据, 并转换为K线列表
-        if ohlcs[-1][0] + 3600 in self.state['candles']:              # 边界情况
+        if ohlcs[-1][0] + 3600 in self.state['candles']:           # 边界情况
             ohlcs.append(self.state['candles'][ohlcs[-1][0] + 3600])
         ohlcs.reverse()                                            # 使K线变为按时间由近到远排序
+        return ohlcs
 
-        avgs = []
-        for i in range(len(ohlcs) - 26 + 1):                       # 计算一目均衡图中的基准线
-            M = max([ohlc[2] for ohlc in ohlcs[i:i+26]])
-            m = min([ohlc[1] for ohlc in ohlcs[i:i+26]])
-            avg = (M + m) / 2
-            avgs.append((ohlcs[i][0], avg))
-        return avgs
+    def calc(self) -> Tuple[List[Tuple[int, float]]]:
+        """
+        计算一目均衡图中的转折线, 基准线, 延迟线, 先行线A与先行线B
+        """
+        ohlcs = self._get_ohlcs_for_calc()
+        turns = max_min_avg(ohlcs, 9)
+        bases = max_min_avg(ohlcs, 26)
+        delays = move(ohlcs, -26, value=lambda o: o[4])
+        _turn_base_avgs = [ (z[0][0], (z[0][1] + z[1][1]) / 2) for z in zip(turns, bases)]
+        antes_1 = move(_turn_base_avgs, 26)
+        _max_min_avg52s = max_min_avg(ohlcs, 52)
+        antes_2 = move(_max_min_avg52s, 26)
+        return turns, bases, delays, antes_1, antes_2
 
     async def subscribe(self) -> asyncio.Queue:
         """
@@ -127,15 +131,15 @@ class Watcher:
         """
         协程: 用于检查目前的运行状态, 包括检查K线缓存是否完整(若不完整则请求)
         """
-        if self.state['ticker'] and len(self.state['sorted_candles']) >= 26:
+        if self.state['ticker'] and len(self.state['sorted_candles']) >= 52:
             # 如果已经准备好数据
 
-            avgs = self.calc_avg()
-            self.state['avgs'] = avgs
+            calcs = self.calc()
+            self.state['calcs'] = calcs
             now = roll_down_to_hours(datetime.now().timestamp())
 
             # 显示状态
-            print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['sorted_candles'][-1]}, {len(self.listeners)}")
+            # print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['sorted_candles'][-1]}, {len(self.listeners)}")
 
         if self.state['start'] is not None and not self.state['fetching']:
             # 如果已完成第一次K线爬取，且未处于爬取状态
@@ -164,7 +168,7 @@ class Watcher:
                     'ticker': self.state['ticker'],
                     'candles': candle_len,
                     'last_candle': last_candle,
-                    'avgs': self.state['avgs'],
+                    'calcs': self.state['calcs'],
                 }))
             # self.ticker_updated_event.set()
         # else:
@@ -181,17 +185,17 @@ class Watcher:
         candles.append(last_candle)
         return candles
 
-    def get_avgs(self) -> List[Tuple[int, float]]:
-        avgs = deepcopy(self.state['avgs'])
-        return avgs
+    def get_calcs(self) -> Tuple[List[Tuple[int, float]]]:
+        calcs = deepcopy(self.state['calcs'])
+        return calcs
 
-    async def next(self, queue: asyncio.Queue) -> Tuple[List[list], List[Tuple[int, float]]]:
+    async def next(self, queue: asyncio.Queue) -> Tuple[List[list], Tuple[List[Tuple[int, float]]]]:
         if queue in self.listeners:
             update = await queue.get()
             queue.task_done()
             return (
                 self.state['sorted_candles'][:update['candles']] + [update['last_candle']],
-                update['avgs'],
+                update['calcs'],
             )
         else:
             return None
