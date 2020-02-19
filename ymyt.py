@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 
 import aiohttp
 import asyncio
@@ -15,20 +15,34 @@ class Watcher:
     def __init__(self, polling_interval: float=1):
         self.state = {
             'ticker': None,      # 缓存最新成交价
-            'candles': {},       # 缓存K线数据
+            'candles': {},       # 缓存K线数据 { t: [t, l, h, o, c, v] }
+            'avgs': [],          # 缓存基准线数据
             'start': None,       # 记录起始K线时间戳
             'count': 0,          # 记录已检查的从start开始的完整K线数据数量
+            'lastest_t': None,   # 最新K线时间戳
             'fetching': False,   # 标记是否正在爬取K线，避免watcher反复创建爬取协程
+            'last_ticker': None, # 缓存上一次成交价
         }
 
-        self.api = CoinBaseApi()
-        self.running = False
-        self.task = None
-        self.polling_interval = polling_interval
+        self.ticker_updated_event = asyncio.Event()                # 标记ticker是否更新 TODO: 目前的实现方式是有缺陷的
+        self.api = CoinBaseApi()                                   # 数据API绑定
+        self.running = False                                       # 运行标志
+        self.task = None                                           # _main()协程自绑定
+        self.polling_interval = polling_interval                   # 定义轮询时间间隔
 
     async def _main(self):
         """
         入口协程
+        """
+        await asyncio.gather(
+            # self._watcher(),                                     # _watcher协程(现在不再单独执行，与_crawler一起执行)
+            self._crawler(),                                       # _crawler协程
+        )
+        await self.api.disconnect()
+
+    async def _init(self):
+        """
+        初始化
         """
         await self.api.connect()                                   # 连接CoinBase API服务器
         candles = await self.api.fetch_ohlc(                       # 完成首次K线爬取
@@ -40,17 +54,12 @@ class Watcher:
             self.state['candles'][t] = [t, l, h, o, c, v]
         self.state['start'] = min(candle[0] for candle in candles) # 初始化起始K线时间戳
 
-        await asyncio.gather(
-            self._watcher(),                                       # watcher协程
-            self._crawler(),                                       # crawler协程
-        )
-        await self.api.disconnect()
-
     async def start(self) -> asyncio.Task:
         """
         启动Watcher
         """
         self.running = True
+        await self._init()
         self.task = asyncio.create_task(self._main())
         return self.task
 
@@ -61,11 +70,13 @@ class Watcher:
         self.running = False
         await self.task
 
-    def calc_avg(self, data: Dict[int, list], start: int, count: int) -> List[float]:
+    def calc_avg(self, data: Dict[int, list], start: int, count: int) -> List[Tuple[int, float]]:
         """
         计算一目均衡图中的基准线
         """
         ohlcs = [data[start + 3600 * i] for i in range(count)]     # 读取已缓存的K线数据, 并转换为K线列表
+        if start + 3600 * count in data:                           # 边界情况
+            ohlcs.append(data[start + 3600 * count])
         ohlcs.reverse()                                            # 使K线变为按时间由近到远排序
 
         avgs = []
@@ -73,7 +84,7 @@ class Watcher:
             M = max([ohlc[2] for ohlc in ohlcs[i:i+26]])
             m = min([ohlc[1] for ohlc in ohlcs[i:i+26]])
             avg = (M + m) / 2
-            avgs.append(avg)
+            avgs.append((ohlcs[i][0], avg))
         return avgs
 
     async def _fetch_one(self, index) -> None:
@@ -88,38 +99,44 @@ class Watcher:
 
     async def _watcher(self) -> None:
         """
-        协程: 用于定时检查目前的运行状态, 包括检查K线缓存是否完整(若不完整则请求)
+        协程: 用于检查目前的运行状态, 包括检查K线缓存是否完整(若不完整则请求)
         """
-        while self.running:
-            # Polling
+        if self.state['ticker']\
+            and self.state['count']\
+            and self.state['count'] >= 26:
+            # 如果已经准备好数据
 
-            if self.state['ticker']\
-                and self.state['count']\
-                and self.state['count'] >= 26:
-                # 如果已经准备好数据
+            avgs = self.calc_avg(self.state['candles'], self.state['start'], self.state['count'])
+            self.state['avgs'] = avgs
+            # now = roll_down_to_hours(datetime.now().timestamp())
 
-                avgs = self.calc_avg(self.state['candles'], self.state['start'], self.state['count'])
-                now = roll_down_to_hours(datetime.now().timestamp())
+            # 显示状态
+            # print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['start'] + 3600 * self.state['count']}, {'牛' if self.state['ticker'] > avgs[0] else '熊'}")
 
-                # 显示状态
-                print(f"{self.state['ticker']}, {self.state['candles'].get(now)}, {self.state['start'] + 3600 * self.state['count']}, {'牛' if self.state['ticker'] > avgs[0] else '熊'}")
-        
-            if self.state['start'] is not None and not self.state['fetching']:
-                # 如果已完成第一次K线爬取，且未处于爬取状态
+        if self.state['start'] is not None and not self.state['fetching']:
+            # 如果已完成第一次K线爬取，且未处于爬取状态
 
-                # 跟踪当前已爬取的K线时间戳
-                # 算法假设从start ~ start + 3600 * count的时间范围内的K线数据是完整的
-                index = self.state['start'] + 3600 * self.state['count']
-                hour = timedelta(hours=1)                               # 1小时
-                while index < (datetime.now() - hour).timestamp():      # 循环直到爬取到最新K线
-                    if index not in self.state['candles']:              # 若该时间戳对应K线不存在，则爬取
-                        asyncio.create_task(self._fetch_one(index))     # 启动爬取K线的协程
-                        break
-                    else:
-                        index += 3600
-                        self.state['count'] += 1
+            # 跟踪当前已爬取的K线时间戳
+            # 算法假设从start ~ start + 3600 * count的时间范围内的K线数据是完整的
+            index = self.state['start'] + 3600 * self.state['count']
+            hour = timedelta(hours=1)                               # 1小时
+            while index < (datetime.now() - hour).timestamp():      # 循环直到爬取到最新K线
+                if index not in self.state['candles']:              # 若该时间戳对应K线不存在，则爬取
+                    asyncio.create_task(self._fetch_one(index))     # 启动爬取K线的协程
+                    break
+                else:
+                    index += 3600
+                    self.state['count'] += 1
+        if self.state['ticker'] != self.state['last_ticker']:
+            self.state['last_ticker'] = self.state['ticker']
+            self.ticker_updated_event.set()
+        else:
+            self.ticker_updated_event.clear()
 
-            await asyncio.sleep(self.polling_interval)
+    async def wait_for_ticker(self) -> None:
+        await self.ticker_updated_event.wait()
+        # print("ticker update!")
+        self.ticker_updated_event.clear()
 
     async def _crawler(self) -> None:
         """
@@ -136,10 +153,22 @@ class Watcher:
             if last_candle:
                 last_candle = last_candle[0]
                 self.state['candles'][last_candle[0]] = last_candle
-            self.state['ticker'] = ticker
+                self.state['lastest_t'] = last_candle[0]
 
+            if ticker:
+                self.state['ticker'] = ticker
+                if self.state['lastest_t']:
+                    # 用最新ticker更新K线数据
+                    assert self.state['lastest_t'] in self.state['candles'], "最新K线时间必然已被保存！"
+                    candle = self.state['candles'][self.state['lastest_t']]
+                    candle[4] = ticker
+                    if candle[1] > ticker:
+                        candle[1] = ticker
+
+                    if candle[2] < ticker:
+                        candle[2] = ticker
+            asyncio.create_task(self._watcher())                        # 此处启动_watcher协程
             await asyncio.sleep(self.polling_interval)
-
 
 async def main():
     watcher = Watcher()

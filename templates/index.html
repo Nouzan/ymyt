@@ -1,26 +1,25 @@
 <html>
-
+    <meta charset="utf-8">
+    <title>一目均衡图</title>
     <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
     <body>
-        <h1>一目均衡图</h1>
     </body>
     <script>
-        function load(name) {
+        function fetch(url) {
             let xhr = new XMLHttpRequest(),
                 okStatus = document.location.protocol === "file:" ? 0 : 200;
-            xhr.open('GET', name, false);
+            xhr.open('GET', url, false);
             xhr.overrideMimeType("text/html;charset=utf-8");//默认为utf-8
             xhr.send(null);
             return xhr.status === okStatus ? xhr.responseText : null;
         }
 
-        function update(series, chart, filename) {
-            return function handle() {
-                let text = load(filename);
-                console.log(text);
-                const datas = JSON.parse(text);
+        function update(series, chart, datas) {
+                datas = datas.map(function(text){
+                    return JSON.parse(text)
+                })
+                // console.log(datas)
                 series.setData(datas);
-            }
         }
         const chart = LightweightCharts.createChart(document.body, {
             width: 1300, 
@@ -63,10 +62,42 @@
                 minMove: 0.000001,
             },
         })
-        
-        filename = 'media/data/ohlc.json'
-        update(candlestickSeries, chart, filename)();
-        chart.timeScale().fitContent();
-        setInterval(update(candlestickSeries, chart, filename), 1 * 1000);
+        const lineSeries = chart.addLineSeries();
+        lineSeries.applyOptions({
+            priceFormat: {
+                type: 'price',
+                precision: 6,
+                minMove: 0.000001,
+            },
+        })
+
+        // Server  < ------ > Client
+        // -----------------> text
+        // text <-------------------
+
+        var ws = new WebSocket("ws://localhost:8000/ws");
+        ws.onmessage = function(event) {
+            text = event.data
+            data = JSON.parse(text)
+            if (data.type == 'candles') {
+                update(candlestickSeries, chart, data.data);
+            } else if (data.type == 'avgs') {
+                update(lineSeries, chart, data.data);
+            } else {
+                console.log("Something wrong")
+            }
+
+        }
+        ws.onopen = function(event) {
+            ws.send('subscribe');
+        }
+
+        // avgsUri = '/api/avgs/'
+        // update(lineSeries, chart, avgsUri)();
+        // candlesUri = '/api/candles/'
+        // update(candlestickSeries, chart, candlesUri)();
+        // chart.timeScale().fitContent();
+        // setInterval(update(candlestickSeries, chart, candlesUri), 1 * 1000);
+        // setInterval(update(lineSeries, chart, avgsUri), 1 * 1000);
     </script>
 </html>

@@ -7,8 +7,10 @@ from starlette.responses import Response
 from starlette.status import HTTP_201_CREATED, HTTP_404_NOT_FOUND
 from starlette.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
+from starlette.websockets import WebSocket
 
 import random
+from datetime import datetime
 import asyncio
 
 from ymyt import Watcher
@@ -20,14 +22,14 @@ templates = Jinja2Templates(directory="templates")
 watcher = Watcher()
 
 class Candle(BaseModel):
-    time: str
+    time: int
     open: float
     high: float
     low: float
     close: float
 
 class Avg(BaseModel):
-    time: str
+    time: int
     value: float
 
 @app.on_event("startup")
@@ -46,12 +48,57 @@ def index(request: Request):
 
 @app.get("/api/candles/")
 def get_candles():
-    return watcher.state['candles']
+    candles = watcher.state['candles']
+    candles = [Candle(
+        time=candles[t][0],
+        open=candles[t][3],
+        high=candles[t][2],
+        low=candles[t][1],
+        close=candles[t][4],
+    ) for t in sorted(candles)]
+    return candles
 
 @app.get("/api/avgs/")
 def get_avgs():
-    return []
+    avgs = watcher.state['avgs']
+    avgs = [Avg(
+        time=avg[0],
+        value=avg[1]
+    ) for avg in sorted(avgs, key=lambda avg: avg[0])]
+    return avgs
 
-@app.post("/api/datafeed/")
-def feed_data():
-    return []
+async def send_datas(websocket):
+    candles = watcher.state['candles']
+    candles = [Candle(
+        time=candles[t][0],
+        open=candles[t][3],
+        high=candles[t][2],
+        low=candles[t][1],
+        close=candles[t][4],
+    ).json() for t in sorted(candles)]
+
+    await websocket.send_json({
+        'type': 'candles',
+        'data': candles
+    })
+
+    avgs = watcher.state['avgs']
+    avgs = [Avg(
+        time=avg[0],
+        value=avg[1]
+    ).json() for avg in sorted(avgs, key=lambda avg: avg[0])]
+
+    await websocket.send_json({
+        'type': 'avgs',
+        'data': avgs
+    })
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    data = await websocket.receive_text()
+    await send_datas(websocket)
+    if data == 'subscribe':
+        while True:
+            await watcher.wait_for_ticker()
+            await send_datas(websocket)
